@@ -100,6 +100,8 @@ No hard-coded strings — every suggestion references the student's actual score
 2. Go to [share.streamlit.io](https://share.streamlit.io) → New app → select `app.py`
 3. No secrets needed (models auto-train on first run)
 
+Or click: https://wvypim4e2brzl7929r82ut.streamlit.app/
+
 ### Render
 1. New Web Service → connect repo
 2. Build command: `pip install -r requirements.txt`
