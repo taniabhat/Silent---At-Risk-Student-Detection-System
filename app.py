@@ -295,32 +295,40 @@ CLUSTER_COLORS = {
 
 
 # ─────────────────────────────────────────────
-# SESSION-STATE BOOTSTRAP & MODEL INIT
+# SESSION-STATE BOOTSTRAP & MICROSERVICE INIT
 # ─────────────────────────────────────────────
 def init_system():
-    """Train (or load cached) models and store in session state."""
+    """Connect to SQLite (DB layer) and check FastAPI (Microservice backend)."""
     if "system_ready" in st.session_state and st.session_state.system_ready:
         return
 
-    from model_trainer import train_and_save, load_artefacts, InterventionAgent
+    import sqlite3
+    import requests
 
-    artefact_dir = "artefacts"
-    required = [
-        os.path.join(artefact_dir, f)
-        for f in ["xgb_model.pkl", "kmeans_model.pkl", "processor.pkl",
-                  "enriched_df.parquet", "metrics.json"]
-    ]
+    API_URL = "http://localhost:8000"
+    st.session_state.api_url = API_URL
 
-    with st.spinner("🔬 Initialising AI engine – one moment…"):
-        if not all(os.path.exists(p) for p in required):
-            train_and_save()
-        art = load_artefacts()
-
-    st.session_state.df      = art["df"]
-    st.session_state.metrics = art["metrics"]
-    st.session_state.xgb     = art["xgb"]
-    st.session_state.kmeans  = art["kmeans"]
-    st.session_state.agent   = InterventionAgent(raw_df=art["df"])
+    with st.spinner("🔬 Connecting to Microservices & Database..."):
+        # 1. Connect to DB instead of loading heavy Parquet into RAM
+        if not os.path.exists("students.db"):
+            st.error("Database missing! Run `py migrate.py` first.")
+            st.stop()
+            
+        conn = sqlite3.connect("students.db")
+        st.session_state.df = pd.read_sql_query("SELECT * FROM students", conn)
+        
+        # 2. Check if FastAPI backend is alive
+        try:
+            res = requests.get(f"{API_URL}/health", timeout=3)
+            res.raise_for_status()
+        except requests.exceptions.RequestException:
+            st.error("Backend microservice is offline. Start it in a new terminal with: `uvicorn api:app --reload`")
+            st.stop()
+            
+        # 3. Load basic metrics from API
+        metrics = requests.get(f"{API_URL}/metrics").json()
+        st.session_state.metrics = metrics
+        
     st.session_state.system_ready = True
 
 
@@ -515,73 +523,6 @@ def chart_score_bars(df: pd.DataFrame) -> go.Figure:
 
 
 # ─────────────────────────────────────────────
-# AI INSIGHT GENERATOR  (Groq LLM)
-# ─────────────────────────────────────────────
-def generate_ai_insight(record: dict, plan: dict) -> str:
-    """Generate personalised AI career insight using Groq LLM."""
-    try:
-        from groq import Groq
-    except ImportError:
-        return "groq package not installed. Run: pip install groq"
-
-    api_key = os.environ.get("GROQ_API_KEY", "")
-    # Fallback: check streamlit secrets
-    if not api_key:
-        try:
-            api_key = st.secrets["GROQ_API_KEY"]
-        except Exception:
-            pass
-    if not api_key:
-        return "Groq API key not configured. Add GROQ_API_KEY to .streamlit/secrets.toml"
-
-    client = Groq(api_key=api_key)
-
-    issues_text = "\n".join(
-        [f"- {i['dimension']}: {i['severity']} (current: {i['value']})"
-         for i in plan.get("issues", [])]
-    ) or "No critical issues detected."
-
-    prompt = f"""You are an expert placement counselor at an engineering college.
-Analyze this student's profile and provide personalized, actionable career advice.
-
-Student Profile:
-- Student ID: {record.get('student_id', 'N/A')}
-- Branch: {record.get('branch', 'N/A')}
-- CGPA: {record.get('cgpa', 'N/A')}
-- Coding Skill: {record.get('coding_skill_score', 'N/A')}/100
-- Communication: {record.get('communication_skill_score', 'N/A')}/100
-- Technical Skill: {record.get('technical_skill_score', 'N/A')}/100
-- Attendance: {record.get('attendance_percentage', 'N/A')}%
-- Projects: {record.get('projects_count', 'N/A')}
-- Certifications: {record.get('certifications_count', 'N/A')}
-- Internship Experience: {'Yes' if record.get('internship_experience', 0) else 'No'}
-- Placement Cluster: {plan.get('cluster_label', 'N/A')}
-- Placement Probability: {plan.get('placement_prob', 0):.1%}
-- High-Risk Flag: {'Yes' if plan.get('risk_label', 0) else 'No'}
-
-Key Issues Identified:
-{issues_text}
-
-Provide a concise but warm and encouraging analysis (200-300 words) with:
-1. Overall assessment of placement readiness
-2. Top 3 specific, actionable recommendations tailored to their exact scores
-3. A motivational closing message
-
-Be specific -- reference their actual scores and branch. Use emojis sparingly."""
-
-    try:
-        completion = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            max_tokens=600,
-        )
-        return completion.choices[0].message.content
-    except Exception as e:
-        return f"AI insight unavailable: {str(e)}"
-
-
-# ─────────────────────────────────────────────
 # ADMIN VIEW
 # ─────────────────────────────────────────────
 def admin_view(df: pd.DataFrame, metrics: dict):
@@ -649,10 +590,15 @@ def admin_view(df: pd.DataFrame, metrics: dict):
     st.markdown("### 📋 Student Directories")
     tab_urgent, tab_placed = st.tabs(["🚨 Urgent Intervention", "🎓 Placed Students"])
 
-    agent   = st.session_state.agent
+    import requests
+    API_URL = st.session_state.api_url
     
     with tab_urgent:
-        urgent  = agent.get_urgent_list(top_n=None)
+        try:
+            res = requests.get(f"{API_URL}/students/at-risk?top_n=30000")
+            urgent = pd.DataFrame(res.json())
+        except:
+            urgent = pd.DataFrame()
     
         if urgent.empty:
             st.info("No students are currently flagged as Silent/At-Risk.")
@@ -766,8 +712,13 @@ def student_view(df: pd.DataFrame):
     st.markdown("#### 2️⃣ Or Quickly Select an At-Risk Student")
     col_sel2, col_btn2 = st.columns([3, 1])
     with col_sel2:
-        urgent_list = st.session_state.agent.get_urgent_list(top_n=20)
-        urgent_ids = urgent_list["student_id"].astype(str).tolist() if not urgent_list.empty else []
+        import requests
+        API_URL = st.session_state.api_url
+        try:
+            res = requests.get(f"{API_URL}/students/at-risk?top_n=20")
+            urgent_ids = [str(r["student_id"]) for r in res.json()]
+        except:
+            urgent_ids = []
         quick_select = st.selectbox("Select ID", ["-- Select ID --"] + urgent_ids, label_visibility="collapsed")
     with col_btn2:
         analyse_quick = st.button("⚡ Analyse Selected")
@@ -800,16 +751,20 @@ def student_view(df: pd.DataFrame):
         
     sid = st.session_state.last_student
 
-    # Fetch plan
-    agent = st.session_state.agent
+    # Fetch plan from API
     with st.spinner("🧠 Generating personalised action plan…"):
-        plan   = agent.generate_plan(sid)
-        record = raw_df[raw_df["student_id"] == sid].iloc[0].to_dict()
+        res = requests.get(f"{API_URL}/students/{sid}")
+        if res.status_code != 200:
+            st.error("Student not found or API error.")
+            return
+            
+        record = res.json()
+        plan = record.get("action_plan", {})
 
     # ── Career Health Meter ───────────────────
-    prob         = plan["placement_prob"]
-    cluster      = plan["cluster_label"]
-    risk_flag    = plan["risk_label"]
+    prob         = plan.get("placement_prob", 0)
+    cluster      = plan.get("cluster_label", "Unknown")
+    risk_flag    = plan.get("risk_label", 0)
     hc           = health_color(prob)
 
     col1, col2, col3 = st.columns([1.2, 1, 1.8], gap="medium")
@@ -869,8 +824,8 @@ def student_view(df: pd.DataFrame):
     ai_key = f"ai_insight_{sid}"
     if st.button("✨ Generate AI-Powered Analysis"):
         with st.spinner("🧠 AI is analysing the student profile..."):
-            insight = generate_ai_insight(record, plan)
-            st.session_state[ai_key] = insight
+            ai_res = requests.get(f"{API_URL}/students/{sid}/counsel").json()
+            st.session_state[ai_key] = ai_res.get("insight", "AI generation failed.")
 
     if ai_key in st.session_state:
         st.markdown(
